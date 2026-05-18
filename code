@@ -1,0 +1,711 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+// ================== CHAN KET NOI ==================
+
+// LED VI TRI 2
+#define LED_SLOT2_EMPTY PA0
+#define LED_SLOT2_FULL  PA1
+
+// LED VI TRI 1
+#define LED_SLOT1_FULL  PA2
+#define LED_SLOT1_EMPTY PA3
+
+// DEN CHIEU SANG THEO CAM BIEN ANH SANG
+#define LIGHT_LED       PA12   // THEM MOI: TOI BAT, SANG TAT
+
+// RFID RC522
+#define RFID_SS   PB0
+#define RFID_RST  PB1
+
+// CAM BIEN
+#define IR1_PIN      PB12
+#define IR2_PIN      PB13
+#define FIRE_PIN     PB11
+#define LIGHT_PIN    PB14
+#define BUTTON_PIN   PB15
+
+// NGOAI VI
+#define BUZZER_PIN   PA15
+#define SERVO_PIN    PA8
+
+// ================== LOGIC CAM BIEN ==================
+
+#define IR_ACTIVE       LOW
+#define FIRE_ACTIVE     LOW
+#define DARK_ACTIVE     HIGH
+
+// ================== LOGIC NGOAI VI ==================
+
+#define BUZZER_ON       HIGH
+#define BUZZER_OFF      LOW
+
+#define LED_ON          HIGH
+#define LED_OFF         LOW
+
+#define GATE_CLOSE      0
+#define GATE_OPEN       90
+
+// ================== THOI GIAN ==================
+
+#define SERIAL_BAUD                 115200
+#define STATUS_INTERVAL             1000
+#define LCD_INTERVAL                500
+#define GATE_OPEN_TIME              3000
+#define BUTTON_DEBOUNCE             250
+#define FIRE_BLINK_TIME             500
+#define INVALID_BEEP_TIME           120
+#define INVALID_BEEP_GAP            120
+#define MAX_INVALID_TRIES           3
+#define INVALID_UID_RESET_TIME      10000
+#define INVALID_UID_SCREEN_TIME     2000
+#define SECURITY_ALARM_DURATION     5000
+#define SECURITY_BUZZER_HALF_PERIOD 50
+
+// ================== DOI TUONG ==================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MFRC522 rfid(RFID_SS, RFID_RST);
+Servo servoMotor;
+
+// ================== BIEN HE THONG ==================
+
+String lastUID = "";
+
+bool slot1Occupied = false;
+bool slot2Occupied = false;
+bool fireDetected = false;
+bool darkDetected = false;
+
+bool barrierOpen = false;
+bool autoCloseActive = false;
+
+bool fireMode = false;
+bool fireBarrierTriggered = false;
+bool invalidUIDScreenActive = false;
+bool securityAlarmActive = false;
+
+bool ledBlinkState = false;
+bool securityBuzzerState = false;
+
+unsigned long gateOpenStart = 0;
+unsigned long lastStatusSend = 0;
+unsigned long lastLCDUpdate = 0;
+unsigned long lastButtonTime = 0;
+unsigned long lastFireBlink = 0;
+unsigned long invalidUIDScreenUntil = 0;
+unsigned long invalidUIDResetAt = 0;
+unsigned long securityAlarmStart = 0;
+unsigned long lastSecurityBuzzerToggle = 0;
+
+int invalidUIDCount = 0;
+
+const byte AUTHORIZED_UIDS[][4] = {
+  {0xB3, 0x8C, 0x13, 0x07},
+  {0x39, 0x47, 0x34, 0x07}
+};
+const int AUTHORIZED_UID_COUNT = sizeof(AUTHORIZED_UIDS) / sizeof(AUTHORIZED_UIDS[0]);
+
+bool prevSlot1 = false;
+bool prevSlot2 = false;
+bool prevFire = false;
+bool prevDark = false;
+bool prevBarrier = false;
+
+String lcdLine0Old = "";
+String lcdLine1Old = "";
+
+// ================== LCD ==================
+
+String formatLCDText(String text) {
+  text.toUpperCase();
+
+  if (text.length() > 16) {
+    text = text.substring(0, 16);
+  }
+
+  int spaces = (16 - text.length()) / 2;
+  String result = "";
+
+  for (int i = 0; i < spaces; i++) {
+    result += " ";
+  }
+
+  result += text;
+
+  while (result.length() < 16) {
+    result += " ";
+  }
+
+  return result;
+}
+
+void lcdPrintLine(uint8_t row, String text) {
+  String line = formatLCDText(text);
+
+  if (row == 0 && line == lcdLine0Old) return;
+  if (row == 1 && line == lcdLine1Old) return;
+
+  lcd.setCursor(0, row);
+  lcd.print(line);
+
+  if (row == 0) {
+    lcdLine0Old = line;
+  } else {
+    lcdLine1Old = line;
+  }
+}
+
+void showLCD(String line1, String line2) {
+  lcdPrintLine(0, line1);
+  lcdPrintLine(1, line2);
+}
+
+void showTempScreen(String line1, String line2, unsigned long delayTime) {
+  lcd.clear();
+  lcdLine0Old = "";
+  lcdLine1Old = "";
+
+  lcdPrintLine(0, line1);
+  lcdPrintLine(1, line2);
+
+  delay(delayTime);
+
+  lcdLine0Old = "";
+  lcdLine1Old = "";
+}
+
+// ================== SERIAL CSV ==================
+
+int getOccupiedCount() {
+  int count = 0;
+
+  if (slot1Occupied) count++;
+  if (slot2Occupied) count++;
+
+  return count;
+}
+
+int getFreeSlotCount() {
+  return 2 - getOccupiedCount();
+}
+
+void sendStatusLine(String type) {
+  Serial.print(type);
+  Serial.print(",");
+  Serial.print(lastUID);
+  Serial.print(",");
+  Serial.print(slot1Occupied ? 1 : 0);
+  Serial.print(",");
+  Serial.print(slot2Occupied ? 1 : 0);
+  Serial.print(",");
+  Serial.print(getOccupiedCount());
+  Serial.print(",");
+  Serial.print(getFreeSlotCount());
+  Serial.print(",");
+  Serial.print(barrierOpen ? "OPEN" : "CLOSED");
+  Serial.print(",");
+  Serial.print(fireDetected ? "F1" : "F0");
+  Serial.print(",");
+  Serial.print(darkDetected ? "D1" : "D0");
+  Serial.print(",");
+  Serial.println(darkDetected ? "L1" : "L0");
+}
+
+void sendStatus() {
+  sendStatusLine("STATUS");
+}
+
+void sendRFIDEvent(String uid) {
+  Serial.print("RFID,");
+  Serial.print(uid);
+  Serial.println(",SCAN");
+}
+
+void sendBarrierEvent(String state, String reason) {
+  Serial.print("BARRIER,");
+  Serial.print(state);
+  Serial.print(",");
+  Serial.println(reason);
+}
+
+void sendFireEvent(bool state) {
+  Serial.print("FIRE,");
+  Serial.print(state ? "F1" : "F0");
+  Serial.print(",");
+  Serial.println(state ? "ALARM" : "CLEAR");
+}
+
+void sendLightEvent(bool state) {
+  Serial.print("LIGHT,");
+  Serial.print(state ? "D1" : "D0");
+  Serial.print(",");
+  Serial.println(state ? "L1" : "L0");
+}
+
+void sendSlotEvent() {
+  sendStatusLine("SLOT");
+}
+
+void sendButtonEvent() {
+  Serial.println("BUTTON,PB15,TOGGLE_BARRIER");
+}
+
+void sendAccessEvent(String uid, bool granted, String reason) {
+  Serial.print("ACCESS,");
+  Serial.print(uid);
+  Serial.print(",");
+  Serial.print(granted ? "OK" : "DENIED");
+  Serial.print(",");
+  Serial.println(reason);
+}
+
+// ================== DIEU KHIEN NGOAI VI ==================
+
+void setBuzzer(bool state) {
+  digitalWrite(BUZZER_PIN, state ? BUZZER_ON : BUZZER_OFF);
+}
+
+void setAllLED(bool state) {
+  digitalWrite(LED_SLOT1_EMPTY, state ? LED_ON : LED_OFF);
+  digitalWrite(LED_SLOT1_FULL,  state ? LED_ON : LED_OFF);
+  digitalWrite(LED_SLOT2_EMPTY, state ? LED_ON : LED_OFF);
+  digitalWrite(LED_SLOT2_FULL,  state ? LED_ON : LED_OFF);
+}
+
+void updateSlotLED() {
+  if (fireDetected) return;
+
+  if (slot1Occupied) {
+    digitalWrite(LED_SLOT1_FULL, LED_ON);
+    digitalWrite(LED_SLOT1_EMPTY, LED_OFF);
+  } else {
+    digitalWrite(LED_SLOT1_FULL, LED_OFF);
+    digitalWrite(LED_SLOT1_EMPTY, LED_ON);
+  }
+
+  if (slot2Occupied) {
+    digitalWrite(LED_SLOT2_FULL, LED_ON);
+    digitalWrite(LED_SLOT2_EMPTY, LED_OFF);
+  } else {
+    digitalWrite(LED_SLOT2_FULL, LED_OFF);
+    digitalWrite(LED_SLOT2_EMPTY, LED_ON);
+  }
+}
+
+// ================== DEN TU DONG THEO ANH SANG ==================
+
+void handleLightAuto() {
+  if (darkDetected) {
+    digitalWrite(LIGHT_LED, LED_ON);    // KHONG CO ANH SANG -> BAT DEN PA12
+  } else {
+    digitalWrite(LIGHT_LED, LED_OFF);   // CO ANH SANG -> TAT DEN PA12
+  }
+}
+
+// ================== BARRIER ==================
+
+void openBarrier(String reason, bool autoClose) {
+  servoMotor.write(GATE_OPEN);
+  barrierOpen = true;
+
+  if (autoClose) {
+    autoCloseActive = true;
+    gateOpenStart = millis();
+  } else {
+    autoCloseActive = false;
+  }
+
+  sendBarrierEvent("OPEN", reason);
+
+  lcdLine0Old = "";
+  lcdLine1Old = "";
+}
+
+void closeBarrier(String reason) {
+  servoMotor.write(GATE_CLOSE);
+  barrierOpen = false;
+  autoCloseActive = false;
+
+  sendBarrierEvent("CLOSED", reason);
+
+  lcdLine0Old = "";
+  lcdLine1Old = "";
+}
+
+void toggleBarrierByButton() {
+  if (securityAlarmActive) return;
+
+  if (barrierOpen) {
+    closeBarrier("BUTTON");
+  } else {
+    openBarrier("BUTTON", false);
+  }
+}
+
+void handleBarrierAutoClose() {
+  if (!barrierOpen) return;
+  if (!autoCloseActive) return;
+  if (fireDetected) return;
+
+  if (millis() - gateOpenStart >= GATE_OPEN_TIME) {
+    closeBarrier("AUTO_CLOSE");
+  }
+}
+
+// ================== RFID ==================
+
+String readUID() {
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) {
+      uid += "0";
+    }
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+
+    if (i < rfid.uid.size - 1) {
+      uid += " ";
+    }
+  }
+
+  uid.toUpperCase();
+  return uid;
+}
+
+bool isAuthorizedUID() {
+  if (rfid.uid.size != 4) {
+    return false;
+  }
+
+  for (int i = 0; i < AUTHORIZED_UID_COUNT; i++) {
+    bool match = true;
+
+    for (byte j = 0; j < 4; j++) {
+      if (rfid.uid.uidByte[j] != AUTHORIZED_UIDS[i][j]) {
+        match = false;
+        break;
+      }
+    }
+
+    if (match) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void beepInvalidUID() {
+  for (int i = 0; i < 2; i++) {
+    setBuzzer(true);
+    delay(INVALID_BEEP_TIME);
+    setBuzzer(false);
+
+    if (i == 0) {
+      delay(INVALID_BEEP_GAP);
+    }
+  }
+}
+
+void triggerSecurityAlarm() {
+  securityAlarmActive = true;
+  securityAlarmStart = millis();
+  lastSecurityBuzzerToggle = millis();
+  securityBuzzerState = true;
+  invalidUIDScreenActive = false;
+  invalidUIDCount = 0;
+  invalidUIDResetAt = 0;
+  setBuzzer(true);
+  lcdLine0Old = "";
+  lcdLine1Old = "";
+  sendAccessEvent(lastUID, false, "SECURITY_LOCKDOWN");
+}
+
+void handleSecurityAlarm() {
+  if (!securityAlarmActive) return;
+
+  unsigned long now = millis();
+
+  if (now - lastSecurityBuzzerToggle >= SECURITY_BUZZER_HALF_PERIOD) {
+    lastSecurityBuzzerToggle = now;
+    securityBuzzerState = !securityBuzzerState;
+    setBuzzer(securityBuzzerState);
+  }
+
+  if (now - securityAlarmStart >= SECURITY_ALARM_DURATION) {
+    securityAlarmActive = false;
+    securityBuzzerState = false;
+    setBuzzer(false);
+    lcdLine0Old = "";
+    lcdLine1Old = "";
+  }
+}
+
+void handleRFID() {
+  if (fireDetected) return;
+  if (securityAlarmActive) return;
+
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  lastUID = readUID();
+  sendRFIDEvent(lastUID);
+
+  if (isAuthorizedUID()) {
+    invalidUIDCount = 0;
+    invalidUIDResetAt = 0;
+    invalidUIDScreenActive = false;
+
+    showLCD("THE HOP LE", lastUID.substring(0, 16));
+    sendAccessEvent(lastUID, true, "AUTHORIZED");
+    Serial.println("ACCESS: AUTHORIZED");
+    openBarrier("RFID", true);
+  } else {
+    closeBarrier("ACCESS_DENIED");
+    invalidUIDCount++;
+    invalidUIDResetAt = millis() + INVALID_UID_RESET_TIME;
+    invalidUIDScreenActive = true;
+    invalidUIDScreenUntil = millis() + INVALID_UID_SCREEN_TIME;
+
+    showLCD("SAI THE RFID", "TU CHOI TRUY CAP");
+    sendAccessEvent(lastUID, false, "UNAUTHORIZED");
+    Serial.println("ACCESS: DENIED");
+    beepInvalidUID();
+
+    if (invalidUIDCount >= MAX_INVALID_TRIES) {
+      triggerSecurityAlarm();
+    }
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// ================== CAM BIEN ==================
+
+void readSensors() {
+  slot1Occupied = digitalRead(IR1_PIN) == IR_ACTIVE;
+  slot2Occupied = digitalRead(IR2_PIN) == IR_ACTIVE;
+  fireDetected = digitalRead(FIRE_PIN) == FIRE_ACTIVE;
+  darkDetected = digitalRead(LIGHT_PIN) == DARK_ACTIVE;
+}
+
+void handleSensorChangeEvents() {
+  if (slot1Occupied != prevSlot1 || slot2Occupied != prevSlot2) {
+    sendSlotEvent();
+    prevSlot1 = slot1Occupied;
+    prevSlot2 = slot2Occupied;
+  }
+
+  if (fireDetected != prevFire) {
+    sendFireEvent(fireDetected);
+    prevFire = fireDetected;
+  }
+
+  if (darkDetected != prevDark) {
+    sendLightEvent(darkDetected);
+    prevDark = darkDetected;
+  }
+
+  if (barrierOpen != prevBarrier) {
+    prevBarrier = barrierOpen;
+  }
+}
+
+// ================== NUT NHAN ==================
+
+void handleButton() {
+  if (securityAlarmActive) return;
+
+  bool buttonPressed = digitalRead(BUTTON_PIN) == LOW;
+  if (!buttonPressed) return;
+
+  if (millis() - lastButtonTime < BUTTON_DEBOUNCE) return;
+  lastButtonTime = millis();
+
+  sendButtonEvent();
+  toggleBarrierByButton();
+}
+
+// ================== BAO CHAY ==================
+
+void handleFireMode() {
+  if (fireDetected) {
+    fireMode = true;
+    setBuzzer(true);
+
+    if (millis() - lastFireBlink >= FIRE_BLINK_TIME) {
+      lastFireBlink = millis();
+      ledBlinkState = !ledBlinkState;
+      setAllLED(ledBlinkState);
+    }
+
+    if (!fireBarrierTriggered) {
+      fireBarrierTriggered = true;
+      openBarrier("FIRE", false);
+    }
+
+    return;
+  }
+
+  if (fireMode) {
+    fireMode = false;
+    fireBarrierTriggered = false;
+    ledBlinkState = false;
+
+    if (!securityAlarmActive) {
+      setBuzzer(false);
+    }
+
+    updateSlotLED();
+    closeBarrier("FIRE_CLEAR");
+    lcdLine0Old = "";
+    lcdLine1Old = "";
+  }
+}
+
+void handleInvalidUIDState() {
+  if (invalidUIDCount > 0 && invalidUIDResetAt > 0 && millis() >= invalidUIDResetAt) {
+    invalidUIDCount = 0;
+    invalidUIDResetAt = 0;
+  }
+
+  if (invalidUIDScreenActive && millis() >= invalidUIDScreenUntil) {
+    invalidUIDScreenActive = false;
+    lcdLine0Old = "";
+    lcdLine1Old = "";
+  }
+}
+
+// ================== LCD MAIN ==================
+
+void updateLCD() {
+  if (millis() - lastLCDUpdate < LCD_INTERVAL) return;
+  lastLCDUpdate = millis();
+
+  if (fireDetected) {
+    showLCD("CANH BAO CHAY", "MO LOI THOAT");
+    return;
+  }
+
+  if (securityAlarmActive) {
+    showLCD("CANH BAO THE", "KHOA HE THONG");
+    return;
+  }
+
+  if (invalidUIDScreenActive) {
+    showLCD("SAI THE RFID", "MOI QUET LAI");
+    return;
+  }
+
+  if (barrierOpen) {
+    showLCD("BARRIER MO", "XE DI QUA");
+    return;
+  }
+
+  if (slot1Occupied && slot2Occupied) {
+    showLCD("BAI DA DAY", "KHONG CON CHO");
+    return;
+  }
+
+  if (darkDetected) {
+    String line2 = "TRONG: " + String(getFreeSlotCount()) + "/2 CHO";
+    showLCD("TROI TOI", line2);
+    return;
+  }
+
+  String line2 = "TRONG: " + String(getFreeSlotCount()) + "/2 CHO";
+  showLCD("BAI DO XE", line2);
+}
+
+// ================== SETUP ==================
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+
+  pinMode(LED_SLOT1_EMPTY, OUTPUT);
+  pinMode(LED_SLOT1_FULL, OUTPUT);
+  pinMode(LED_SLOT2_EMPTY, OUTPUT);
+  pinMode(LED_SLOT2_FULL, OUTPUT);
+
+  pinMode(LIGHT_LED, OUTPUT);        // THEM MOI
+  digitalWrite(LIGHT_LED, LED_OFF);  // BAN DAU TAT DEN PA12
+
+  pinMode(IR1_PIN, INPUT_PULLUP);
+  pinMode(IR2_PIN, INPUT_PULLUP);
+  pinMode(FIRE_PIN, INPUT_PULLUP);
+  pinMode(LIGHT_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  setBuzzer(false);
+  setAllLED(false);
+
+  servoMotor.attach(SERVO_PIN);
+  servoMotor.write(GATE_CLOSE);
+  barrierOpen = false;
+
+  Wire.setSCL(PB6);
+  Wire.setSDA(PB7);
+  Wire.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  showTempScreen("BAI DO XE", "KHOI DONG...", 1000);
+
+  SPI.setSCLK(PA5);
+  SPI.setMISO(PA6);
+  SPI.setMOSI(PA7);
+  SPI.begin();
+
+  rfid.PCD_Init();
+
+  readSensors();
+
+  prevSlot1 = slot1Occupied;
+  prevSlot2 = slot2Occupied;
+  prevFire = fireDetected;
+  prevDark = darkDetected;
+  prevBarrier = barrierOpen;
+
+  updateSlotLED();
+  handleLightAuto(); // CAP NHAT DEN PA12 NGAY KHI KHOI DONG
+
+  Serial.println("BOOT,SYSTEM_READY");
+  sendStatus();
+
+  showTempScreen("HE THONG", "SAN SANG", 800);
+}
+
+// ================== LOOP ==================
+
+void loop() {
+  readSensors();
+
+  handleSensorChangeEvents();
+  handleLightAuto();       // THEM MOI: SANG TAT DEN, TOI BAT DEN
+  handleFireMode();
+  handleSecurityAlarm();
+  handleInvalidUIDState();
+  handleBarrierAutoClose();
+
+  if (!fireDetected) {
+    updateSlotLED();
+    handleButton();
+    handleRFID();
+  }
+
+  updateLCD();
+
+  if (millis() - lastStatusSend >= STATUS_INTERVAL) {
+    lastStatusSend = millis();
+    sendStatus();
+  }
+}
